@@ -12,6 +12,8 @@ from natsort import natsorted
 from sonic_py_common import multi_asic
 from swsscommon.swsscommon import SonicV2Connector, ConfigDBConnector
 from utilities_common.general import load_db_config
+import time
+
 
 def info(msg):
     click.echo(click.style("Info: ", fg='cyan') + click.style(str(msg), fg='green'))
@@ -81,6 +83,9 @@ class AclLoader(object):
     ACL_STAGE_CAPABILITY_TABLE = "ACL_STAGE_CAPABILITY_TABLE"
     ACL_ACTIONS_CAPABILITY_FIELD = "action_list"
     ACL_ACTION_CAPABILITY_FIELD = "ACL_ACTION"
+    DEFAULT_RULE = "DEFAULT_RULE"
+
+    STATE_DB_ACL_TTL_TABLE = "ACL_TTL_TABLE"
 
     min_priority = 1
     max_priority = 10000
@@ -116,6 +121,7 @@ class AclLoader(object):
         self.tables_db_info = {}
         self.rules_db_info = {}
         self.rules_info = {}
+        self.rules_ttl = {}
 
         # Load database config files
         load_db_config()
@@ -340,15 +346,16 @@ class AclLoader(object):
                 raise AclLoaderException("Invalid input file %s" % filename)
         return yang_acl
 
-    def load_rules_from_file(self, filename):
+    def load_rules_from_file(self, filename, is_dynamic=False):
         """
         Load file with ACL rules configuration in openconfig ACL format. Convert rules
         to Config DB schema.
         :param filename: File in openconfig ACL format
+        :param is_dynamic: A bool, indicates whether the rule is dynamic or not
         :return:
         """
         self.yang_acl = AclLoader.parse_acl_json(filename)
-        self.convert_rules()
+        self.convert_rules(is_dynamic)
 
     def convert_action(self, table_name, rule_idx, rule):
         rule_props = {}
@@ -583,6 +590,62 @@ class AclLoader(object):
 
         return rule_props
 
+    def is_db_rule_dynamic(self, key):
+        try:
+            data = self.configdb.get_entry(self.ACL_RULE, key)
+            if 'is_dynamic' in data and data['is_dynamic'].lower() == 'true':
+                return True
+            return False
+        except:
+            return False
+        
+    def is_dynamic_rule(self, rule):
+        return rule.dynamic_acl.config.ttl
+
+    def convert_dynamic_acl_config(self, key, rule):
+        rule_props = {}
+        # The ttl value is not written into ACL_RULE table as we don't want
+        # update notificaton when TTL is changed
+        if self.is_dynamic_rule(rule):
+            rule_props['is_dynamic'] = 'True'
+        self.rules_ttl[key] = int(rule.dynamic_acl.config.ttl)
+        
+        return rule_props
+
+    def add_state_db_ttl_entry(self, table_name, entry_name, ttl):
+        """
+        Insert entry to STATE_DB for dynamic ACL
+        """
+        key_name = self.STATE_DB_ACL_TTL_TABLE + '|' + table_name + '|' + entry_name
+        try:
+            timenow = int(time.time())
+            values = {
+                "ttl": str(ttl),
+                "creation_time": str(timenow),
+                "expiration_time": str(timenow + ttl)
+            }
+            self.statedb.hmset(self.statedb.STATE_DB, key_name, values)
+            info("Added STATE_DB entry for rule {} ttl = {}".format(entry_name, ttl))
+        except Exception as e:
+            raise AclLoaderException("Failed to add STATE_DB entry for {}; error is {}".format(entry_name, str(e)))
+    
+    def remove_state_db_ttl_entry(self, table_name, entry_name):
+        """
+        Insert entry to STATE_DB for dynamic ACL
+        """
+        key_name = self.STATE_DB_ACL_TTL_TABLE + '|' + table_name + '|' + entry_name
+        try:
+            
+            self.statedb.delete(self.statedb.STATE_DB, key_name)
+            info("Removed STATE_DB entry for rule {}".format(entry_name))
+        except Exception as e:
+            raise AclLoaderException("Failed to remove STATE_DB entry for {}; error is {}".format(entry_name, str(e)))
+
+    def handle_dynamic_acl_config(self, table_name, rule):
+        if not rule.dynamic_acl.config.ttl:
+            return
+    
+
     def validate_rule_fields(self, rule_props):
         protocol = rule_props.get("IP_PROTOCOL")
 
@@ -596,16 +659,24 @@ class AclLoader(object):
             if ("ICMPV6_TYPE" in rule_props or "ICMPV6_CODE" in rule_props) and protocol != 58:
                 raise AclLoaderException("IP_PROTOCOL={} is not ICMPV6, but ICMPV6 fields were provided".format(protocol))
 
-    def convert_rule_to_db_schema(self, table_name, rule):
+    def convert_rule_to_db_schema(self, table_name, rule, rule_name, is_dynamic):
         """
         Convert rules format from openconfig ACL to Config DB schema
         :param table_name: ACL table name to which rule belong
         :param rule: ACL rule in openconfig format
+        :param rule_name: The name of ACL rule, can be None
+        :param is_dynamic: A bool, indicates whether the rule is dynamic or not
         :return: dict with Config DB schema
         """
-        rule_idx = int(rule.config.sequence_id)
         rule_props = {}
-        rule_data = {(table_name, "RULE_" + str(rule_idx)): rule_props}
+        if is_dynamic and not self.is_dynamic_rule(rule):
+            warning("Attempting to insert a dynamic ACL rule without TTL, refused")
+            return {}
+        rule_idx = int(rule.config.sequence_id)
+        if not rule_name:
+            rule_name = "RULE_" + str(rule_idx)
+        rule_key = (table_name, rule_name)
+        rule_data = {rule_key: rule_props}
 
         rule_props["PRIORITY"] = str(self.max_priority - rule_idx)
 
@@ -621,6 +692,7 @@ class AclLoader(object):
         deep_update(rule_props, self.convert_icmp(table_name, rule_idx, rule))
         deep_update(rule_props, self.convert_transport(table_name, rule_idx, rule))
         deep_update(rule_props, self.convert_input_interface(table_name, rule_idx, rule))
+        deep_update(rule_props, self.convert_dynamic_acl_config(rule_key, rule))
 
         self.validate_rule_fields(rule_props)
 
@@ -633,7 +705,7 @@ class AclLoader(object):
         :return: dict with Config DB schema
         """
         rule_props = {}
-        rule_data = {(table_name, "DEFAULT_RULE"): rule_props}
+        rule_data = {(table_name, self.DEFAULT_RULE): rule_props}
         rule_props["PRIORITY"] = str(self.min_priority)
         rule_props["PACKET_ACTION"] = "DROP"
         if self.is_table_ipv6(table_name):
@@ -642,9 +714,10 @@ class AclLoader(object):
             rule_props["ETHER_TYPE"] = str(self.ethertype_map["ETHERTYPE_IPV4"])
         return rule_data
 
-    def convert_rules(self):
+    def convert_rules(self, is_dynamic):
         """
         Convert rules in openconfig ACL format to Config DB schema
+        :param is_dynamic: A bool, indicates whether the rule is dynamic or not
         :return:
         """
         for acl_set_name in self.yang_acl.acl.acl_sets.acl_set:
@@ -661,7 +734,13 @@ class AclLoader(object):
             for acl_entry_name in acl_set.acl_entries.acl_entry:
                 acl_entry = acl_set.acl_entries.acl_entry[acl_entry_name]
                 try:
-                    rule = self.convert_rule_to_db_schema(table_name, acl_entry)
+                    acl_name_to_use = None
+                    if is_dynamic:
+                        acl_name_to_use = "DYNAMIC_RULE_" + acl_entry_name
+                    rule = self.convert_rule_to_db_schema(table_name=table_name,
+                                                          rule=acl_entry,
+                                                          rule_name=acl_name_to_use,
+                                                          is_dynamic=is_dynamic)
                     deep_update(self.rules_info, rule)
                 except AclLoaderException as ex:
                     error("Error processing rule %s: %s. Skipped." % (acl_entry_name, ex))
@@ -764,6 +843,43 @@ class AclLoader(object):
                 # For control plane ACL it's not needed but to keep all db in sync program everywhere
                 for namespace_configdb in self.per_npu_configdb.values():
                     namespace_configdb.set_entry(self.ACL_RULE, key, self.rules_info[key])
+
+    def update_dynamic_acl_rules(self):
+        """
+        Perform update of dynamic ACL rule.
+        Renew the TTL of ACL rule if existing, or insert new dynamic ACL rule
+        :return:
+        """
+        for key, entry in self.rules_info.items():
+            if key[1] == self.DEFAULT_RULE:
+                continue
+            if key in self.rules_db_info:
+                if not self.is_db_rule_dynamic(key):
+                    warning("Attempting to overwrite a non-dynamic rule {}".format(key))
+                    continue
+            else:
+                self.configdb.mod_entry(self.ACL_RULE, key, entry)
+                info("Added a new dynamic ACL rule {}".format(key))
+
+            self.add_state_db_ttl_entry(table_name=key[0], entry_name=key[1], ttl=self.rules_ttl[key])
+
+    def remove_dynamic_acl_rules(self):
+        """
+        Remove dynamic ACL rule specified by input json file.
+        1. Remove entry from CONFIG_DB (must be dynamic)
+        2. Remove TTL entry from STATE_DB
+        :return:
+        """
+        for key, entry in self.rules_info.items():
+            if key[1] == self.DEFAULT_RULE:
+                continue
+            if key in self.rules_db_info:
+                if not self.is_db_rule_dynamic(key):
+                    warning("Attempting to remove a non-dynamic rule {}".format(key))
+                    continue
+                self.configdb.mod_entry(self.ACL_RULE, key, None)
+                info("Removed a dynamic ACL rule {}".format(key))
+            self.remove_state_db_ttl_entry(table_name=key[0], entry_name=key[1])
 
     def delete(self, table=None, rule=None):
         """
@@ -899,7 +1015,7 @@ class AclLoader(object):
             return action
 
         def pop_matches(val):
-            matches = list(sorted(["%s: %s" % (k, val[k]) for k in val]))
+            matches = list(sorted(["%s: %s" % (k, val[k]) for k in val if k != "is_dynamic"]))
             if len(matches) == 0:
                 matches.append("N/A")
             return matches
@@ -1065,6 +1181,26 @@ def incremental(ctx, filename, session_name, mirror_stage, max_priority):
     acl_loader.load_rules_from_file(filename)
     acl_loader.incremental_update()
 
+@update.command()
+@click.argument('filename', type=click.Path(exists=True))
+@click.option('--table_name', type=click.STRING, required=False)
+@click.option('--max_priority', type=click.INT, required=False)
+@click.pass_context
+def dynamic(ctx, filename, table_name, max_priority):
+    """
+    Create dynamic ACL rule, or renew the TTL of an existing dynamic ACL rule
+    If a table_name is provided, the operation will be restricted in the specified table.
+    """
+    acl_loader = ctx.obj["acl_loader"]
+
+    if table_name:
+        acl_loader.set_table_name(table_name)
+
+    if max_priority:
+        acl_loader.set_max_priority(max_priority)
+
+    acl_loader.load_rules_from_file(filename, True)
+    acl_loader.update_dynamic_acl_rules()
 
 @cli.command()
 @click.argument('table', required=False)
@@ -1078,6 +1214,23 @@ def delete(ctx, table, rule):
 
     acl_loader.delete(table, rule)
 
+
+@cli.command()
+@click.argument('filename', type=click.Path(exists=True))
+@click.option('--table_name', type=click.STRING, required=False)
+@click.pass_context
+def delete_dynamic(ctx, filename, table_name):
+    """
+    Delete dynamic ACL rules.
+    If a table_name is provided, the operation will be restricted in the specified table.
+    """
+    acl_loader = ctx.obj["acl_loader"]
+
+    if table_name:
+        acl_loader.set_table_name(table_name)
+
+    acl_loader.load_rules_from_file(filename, True)
+    acl_loader.remove_dynamic_acl_rules()
 
 if __name__ == "__main__":
     try:
